@@ -163,6 +163,7 @@ enum CheckPrompt {
     Switch {
         network: Network,
         printer: String,
+        current_default: String,
     },
 }
 
@@ -380,7 +381,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_RETRY_NETWORK => {
-            start_network_check(hwnd, true, true);
+            start_network_check(hwnd, wparam.0 != 0, true);
             LRESULT(0)
         }
         WM_UI_SHOW_RETRY => {
@@ -795,7 +796,6 @@ unsafe fn handle_command(hwnd: HWND, command: usize) {
 unsafe fn show_window(hwnd: HWND) {
     if let Some(ui_hwnd) = find_ui_window() {
         let _ = PostMessageW(Some(ui_hwnd), WM_UI_SHOW, WPARAM(0), LPARAM(0));
-        let _ = PostMessageW(Some(ui_hwnd), WM_UI_REFRESH, WPARAM(0), LPARAM(0));
         return;
     }
     if let Err(error) = spawn_ui() {
@@ -843,7 +843,6 @@ unsafe extern "system" fn find_ui_window_callback(hwnd: HWND, lparam: LPARAM) ->
 unsafe fn show_window_retry(hwnd: HWND, attempt: u32) {
     if let Some(ui_hwnd) = find_ui_window() {
         let _ = PostMessageW(Some(ui_hwnd), WM_UI_SHOW, WPARAM(0), LPARAM(0));
-        let _ = PostMessageW(Some(ui_hwnd), WM_UI_REFRESH, WPARAM(0), LPARAM(0));
     } else if attempt < 40 {
         schedule_ui_show_retry(hwnd, attempt + 1);
     }
@@ -1120,7 +1119,7 @@ unsafe fn evaluate_network(hwnd: HWND, connection_event: bool, network: Network)
         let mut state = STATE.get().unwrap().lock().unwrap();
         if !state.printers_loaded {
             drop(state);
-            schedule_network_retry(hwnd);
+            schedule_network_retry(hwnd, true);
             return;
         }
         let config = match load_config_result() {
@@ -1128,7 +1127,7 @@ unsafe fn evaluate_network(hwnd: HWND, connection_event: bool, network: Network)
             Err(error) => {
                 drop(state);
                 report_check_error(hwnd, &error);
-                schedule_network_retry(hwnd);
+                schedule_network_retry(hwnd, false);
                 return;
             }
         };
@@ -1195,6 +1194,12 @@ unsafe fn evaluate_network(hwnd: HWND, connection_event: bool, network: Network)
                     prompt = Some(CheckPrompt::Switch {
                         network,
                         printer: association.printer,
+                        current_default: state
+                            .printers
+                            .iter()
+                            .find(|printer| printer.is_default)
+                            .map(|printer| printer.name.clone())
+                            .unwrap_or_else(|| "No default printer detected".to_string()),
                     });
                 }
             }
@@ -1218,7 +1223,11 @@ unsafe fn evaluate_network(hwnd: HWND, connection_event: bool, network: Network)
                 MB_OK | MB_ICONWARNING | MB_TOPMOST,
             );
         }
-        Some(CheckPrompt::Switch { network, printer }) => {
+        Some(CheckPrompt::Switch {
+            network,
+            printer,
+            current_default,
+        }) => {
             balloon(
                 hwnd,
                 "Associated printer network found",
@@ -1227,8 +1236,8 @@ unsafe fn evaluate_network(hwnd: HWND, connection_event: bool, network: Network)
             let answer = message(
                 hwnd,
                 &format!(
-                    "Network: {}\nAssociated printer: {}\n\nSwitch Windows default printer?",
-                    network.name, printer
+                    "Network: {}\nCurrent default: {}\nSwitch to: {}\n\nWould you like to switch the Windows default printer?",
+                    network.name, current_default, printer
                 ),
                 "NetPrintSwitch",
                 MB_YESNO | MB_ICONQUESTION | MB_TOPMOST,
@@ -1236,8 +1245,9 @@ unsafe fn evaluate_network(hwnd: HWND, connection_event: bool, network: Network)
             if answer == windows::Win32::UI::WindowsAndMessaging::IDYES {
                 match set_default_printer(&printer) {
                     Ok(()) => {
-                        if refresh_printers_for_event().is_err() {
-                            schedule_network_retry(hwnd);
+                        if let Err(error) = refresh_printers_for_event() {
+                            report_check_error(hwnd, &error);
+                            schedule_network_retry(hwnd, true);
                         }
                         balloon(hwnd, "Default printer switched", &printer);
                     }
@@ -1311,6 +1321,10 @@ fn start_network_check(hwnd: HWND, refresh_printers: bool, connection_event: boo
                 {
                     drop(Box::from_raw(raw));
                     CHECK_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+                    if !EXIT_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+                        report_check_error(hwnd, "could not deliver the network check result");
+                        schedule_network_retry(hwnd, refresh_printers);
+                    }
                 }
             }
         });
@@ -1320,7 +1334,7 @@ fn start_network_check(hwnd: HWND, refresh_printers: bool, connection_event: boo
             HWND(hwnd_raw as *mut std::ffi::c_void),
             &format!("could not start network check: {error}"),
         );
-        schedule_network_retry(HWND(hwnd_raw as *mut std::ffi::c_void));
+        schedule_network_retry(HWND(hwnd_raw as *mut std::ffi::c_void), refresh_printers);
     }
 }
 
@@ -1336,7 +1350,7 @@ unsafe fn handle_network_result(hwnd: HWND, result: NetworkCheckResult) {
             Ok(printers) => printers,
             Err(error) => {
                 report_check_error(hwnd, &error);
-                schedule_network_retry(hwnd);
+                schedule_network_retry(hwnd, true);
                 CHECK_PENDING.store(false, std::sync::atomic::Ordering::Release);
                 return;
             }
@@ -1351,7 +1365,7 @@ unsafe fn handle_network_result(hwnd: HWND, result: NetworkCheckResult) {
         Ok(network) => network,
         Err(error) => {
             report_check_error(hwnd, &error);
-            schedule_network_retry(hwnd);
+            schedule_network_retry(hwnd, false);
             CHECK_PENDING.store(false, std::sync::atomic::Ordering::Release);
             return;
         }
@@ -1372,7 +1386,7 @@ unsafe fn handle_network_result(hwnd: HWND, result: NetworkCheckResult) {
     }
 }
 
-fn schedule_network_retry(hwnd: HWND) {
+fn schedule_network_retry(hwnd: HWND, refresh_printers: bool) {
     let retry_state = RETRY_SCHEDULED.get_or_init(|| Mutex::new(false));
     let mut scheduled = retry_state.lock().unwrap();
     if *scheduled {
@@ -1394,7 +1408,16 @@ fn schedule_network_retry(hwnd: HWND) {
             }
             unsafe {
                 let hwnd = HWND(hwnd as *mut std::ffi::c_void);
-                let _ = PostMessageW(Some(hwnd), WM_RETRY_NETWORK, WPARAM(0), LPARAM(0));
+                if PostMessageW(
+                    Some(hwnd),
+                    WM_RETRY_NETWORK,
+                    WPARAM(refresh_printers as usize),
+                    LPARAM(0),
+                )
+                .is_err()
+                {
+                    report_check_error(hwnd, "could not deliver the scheduled retry");
+                }
             }
         });
     if spawn_result.is_err() {
@@ -1454,9 +1477,9 @@ fn remove_scheduled_task() -> Result<(), String> {
     if output.status.success() {
         Ok(())
     } else {
-        let details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let details = command_output_text(&output.stderr).trim().to_string();
         let details = if details.is_empty() {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
+            command_output_text(&output.stdout).trim().to_string()
         } else {
             details
         };
@@ -1523,12 +1546,24 @@ fn scheduled_task_matches(executable: &std::path::Path) -> bool {
     if !output.status.success() {
         return false;
     }
-    let xml = command_output_text(&output.stdout).to_ascii_lowercase();
+    let xml = command_output_text(&output.stdout);
+    scheduled_task_xml_matches(&xml, executable)
+}
+
+fn scheduled_task_xml_matches(xml: &str, executable: &std::path::Path) -> bool {
+    let xml = xml.to_ascii_lowercase();
     let expected = executable
         .to_string_lossy()
         .replace('/', "\\")
         .to_ascii_lowercase();
-    xml.contains(&expected) && xml.contains("<arguments>--check-network</arguments>")
+    xml.contains(&expected)
+        && xml.contains("<arguments>--check-network</arguments>")
+        && xml.contains("<eventtrigger")
+        && xml.contains("microsoft-windows-networkprofile/operational")
+        && xml.contains("eventid=10000")
+        && xml.contains("<enabled>true</enabled>")
+        && xml.contains("<logontype>interactivetoken</logontype>")
+        && xml.contains("<runlevel>leastprivilege</runlevel>")
 }
 
 fn command_output_text(bytes: &[u8]) -> String {
@@ -1796,9 +1831,9 @@ fn invalidate_printer_cache() {
 }
 
 fn command_output_error(operation: &str, output: &Output) -> String {
-    let details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let details = command_output_text(&output.stderr).trim().to_string();
     let details = if details.is_empty() {
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
+        command_output_text(&output.stdout).trim().to_string()
     } else {
         details
     };
@@ -1822,6 +1857,14 @@ pub(crate) fn set_default_printer(printer: &str) -> Result<(), String> {
     ]);
     let output = run_command_with_timeout(command, "default printer change", COMMAND_TIMEOUT)?;
     if output.status.success() {
+        verify_default_printer(printer)
+    } else {
+        Err(command_output_error("default printer change", &output))
+    }
+}
+
+fn verify_default_printer(printer: &str) -> Result<(), String> {
+    for attempt in 0..5 {
         invalidate_printer_cache();
         let printers = enumerate_printers_result()
             .map_err(|error| format!("printer changed, but verification failed: {error}"))?;
@@ -1829,16 +1872,13 @@ pub(crate) fn set_default_printer(printer: &str) -> Result<(), String> {
             .iter()
             .any(|item| item.is_default && normalize(&item.name) == normalize(printer))
         {
-            Ok(())
-        } else {
-            Err(
-                "Windows reported success, but the requested printer is not the default"
-                    .to_string(),
-            )
+            return Ok(());
         }
-    } else {
-        Err(command_output_error("default printer change", &output))
+        if attempt < 4 {
+            thread::sleep(Duration::from_millis(200));
+        }
     }
+    Err("Windows reported success, but the requested printer is not the default".to_string())
 }
 
 fn config_path() -> PathBuf {
@@ -1872,12 +1912,13 @@ fn load_config_unlocked() -> Result<Config, String> {
                 .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
                 .map(|duration| duration.as_nanos())
                 .unwrap_or_default();
-            let backup = path.with_file_name(format!("config.json.corrupt-{stamp}"));
-            let backup_error = if backup.exists() {
-                None
-            } else {
-                fs::copy(&path, &backup).err()
-            };
+            let mut backup = path.with_file_name(format!("config.json.corrupt-{stamp}"));
+            let mut suffix = 1u32;
+            while backup.exists() {
+                backup = path.with_file_name(format!("config.json.corrupt-{stamp}-{suffix}"));
+                suffix = suffix.saturating_add(1);
+            }
+            let backup_error = fs::copy(&path, &backup).err();
             let detail = backup_error
                 .map(|error| format!(" Could not preserve corrupt file: {error}."))
                 .unwrap_or_default();
@@ -2057,5 +2098,23 @@ mod tests {
         let output = run_command_with_timeout(command, "test command", Duration::from_secs(2))
             .expect("timed command should succeed");
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "printer");
+    }
+
+    #[test]
+    fn task_validation_requires_expected_trigger_and_security() {
+        let executable =
+            std::path::Path::new(r"C:\Program Files\NetPrintSwitch\netprintswitch.exe");
+        let xml = r#"
+            <Task>
+              <Principals><Principal><RunLevel>LeastPrivilege</RunLevel><LogonType>InteractiveToken</LogonType></Principal></Principals>
+              <Triggers><EventTrigger><Enabled>true</Enabled><Subscription>Microsoft-Windows-NetworkProfile/Operational *[System/EventID=10000]</Subscription></EventTrigger></Triggers>
+              <Actions><Exec><Command>C:\Program Files\NetPrintSwitch\netprintswitch.exe</Command><Arguments>--check-network</Arguments></Exec></Actions>
+            </Task>
+        "#;
+        assert!(scheduled_task_xml_matches(xml, executable));
+        assert!(!scheduled_task_xml_matches(
+            &xml.replace("EventID=10000", "EventID=9999"),
+            executable
+        ));
     }
 }

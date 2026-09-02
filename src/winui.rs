@@ -42,6 +42,7 @@ const ACCENT: Color = Color::rgb(0, 95, 184);
 static ICON_PATH: OnceLock<Option<&'static str>> = OnceLock::new();
 static ORIGINAL_WND_PROC: OnceLock<(usize, WNDPROC)> = OnceLock::new();
 static CLOSE_INTERCEPTOR_STARTED: AtomicBool = AtomicBool::new(false);
+static CLOSE_HOOK_FAILURE_NOTIFIED: AtomicBool = AtomicBool::new(false);
 static CLOSE_BEHAVIOR: OnceLock<Mutex<CloseBehavior>> = OnceLock::new();
 static CLOSE_DECISION: OnceLock<Mutex<Option<CloseAction>>> = OnceLock::new();
 
@@ -80,6 +81,7 @@ fn install_close_interceptor() {
                         )
                     };
                     if previous != 0 {
+                        CLOSE_HOOK_FAILURE_NOTIFIED.store(false, Ordering::Release);
                         let previous = unsafe { mem::transmute::<isize, WNDPROC>(previous) };
                         let _ = ORIGINAL_WND_PROC.set((hwnd.0 as usize, previous));
                         return;
@@ -87,11 +89,19 @@ fn install_close_interceptor() {
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            unsafe { notify_close_interceptor_failure() };
+            if !CLOSE_HOOK_FAILURE_NOTIFIED.swap(true, Ordering::AcqRel) {
+                unsafe { notify_close_interceptor_failure() };
+            }
+            CLOSE_INTERCEPTOR_STARTED.store(false, Ordering::Release);
+            thread::sleep(Duration::from_secs(5));
+            install_close_interceptor();
         })
         .is_err()
     {
         CLOSE_INTERCEPTOR_STARTED.store(false, Ordering::Release);
+        if !CLOSE_HOOK_FAILURE_NOTIFIED.swap(true, Ordering::AcqRel) {
+            unsafe { notify_close_interceptor_failure() };
+        }
     }
 }
 
@@ -263,6 +273,8 @@ struct NetPrintSwitch {
     prompt_mode: PromptMode,
     status: String,
     data_loading: bool,
+    behavior_expanded: bool,
+    window_width: f64,
 }
 
 #[derive(Clone)]
@@ -271,6 +283,8 @@ enum Message {
     PrinterChanged(Option<usize>),
     PromptModeChanged(Option<usize>),
     CloseBehaviorChanged(Option<usize>),
+    BehaviorExpandedChanged(bool),
+    WindowSizeChanged(WindowSize),
     SaveAssociation,
     DeleteAssociation(usize),
     Refresh,
@@ -307,6 +321,8 @@ impl Component for NetPrintSwitch {
             status: config_error
                 .unwrap_or_else(|| "Loading printers and network status…".to_string()),
             data_loading: true,
+            behavior_expanded: false,
+            window_width: 1000.0,
         };
         context.spawn_background(|_| Message::InitialDataLoaded {
             config: load_config_result(),
@@ -320,6 +336,8 @@ impl Component for NetPrintSwitch {
         match message {
             Message::NetworkChanged(value) => self.network_name = value,
             Message::PrinterChanged(index) => self.selected_printer = index,
+            Message::BehaviorExpandedChanged(expanded) => self.behavior_expanded = expanded,
+            Message::WindowSizeChanged(size) => self.window_width = size.width,
             Message::PromptModeChanged(index) => {
                 let prompt_mode = if index == Some(1) {
                     PromptMode::EveryConnection
@@ -387,6 +405,7 @@ impl Component for NetPrintSwitch {
             }
             Message::Refresh => {
                 if self.data_loading {
+                    self.status = "Initial load is still in progress…".to_string();
                     return;
                 }
                 self.data_loading = true;
@@ -423,6 +442,7 @@ impl Component for NetPrintSwitch {
 
     fn view(&self, _input: &(), context: &mut ViewContext<Self>) -> View {
         context.window_title("NetPrintSwitch");
+        context.on_window_size(context.callback(Message::WindowSizeChanged));
         UI_REFRESH_CALLBACK.with(|slot| {
             *slot.borrow_mut() = Some(context.message(Message::Refresh));
         });
@@ -449,10 +469,38 @@ impl Component for NetPrintSwitch {
             .as_ref()
             .map(|network| network.network_type.as_str())
             .unwrap_or("Not detected");
-        let network_summary = if self.network_name.is_empty() {
+        let network_summary = if self.data_loading && self.current_network.is_none() {
+            "Detecting network…".to_string()
+        } else if self.network_name.is_empty() {
             "No active network detected".to_string()
         } else {
             format!("{} · {}", self.network_name, network_type)
+        };
+        let can_save = !self.data_loading
+            && !self.network_name.trim().is_empty()
+            && self
+                .selected_printer
+                .is_some_and(|index| index < self.printers.len());
+        let compact_layout = self.window_width < 900.0;
+        let status_is_error = self.status.starts_with("Could not")
+            || self.status.contains("failed")
+            || self.status.contains("invalid")
+            || self.status.contains("unavailable");
+        let status_title = if self.data_loading {
+            "Working"
+        } else if status_is_error {
+            "Needs attention"
+        } else if self.status.ends_with(".") {
+            "Ready"
+        } else {
+            "Status"
+        };
+        let status_severity = if self.data_loading {
+            InfoBarSeverity::Informational
+        } else if status_is_error {
+            InfoBarSeverity::Error
+        } else {
+            InfoBarSeverity::Success
         };
 
         let printer_items = self.printers.iter().map(|printer| {
@@ -462,6 +510,13 @@ impl Component for NetPrintSwitch {
                 printer.name.clone()
             }
         });
+        let printer_placeholder = if self.data_loading {
+            "Loading printers…"
+        } else if self.printers.is_empty() {
+            "No printers found"
+        } else {
+            "Select a printer"
+        };
         let prompt_items = [
             "Once per connection".to_string(),
             "Every connection".to_string(),
@@ -517,7 +572,7 @@ impl Component for NetPrintSwitch {
                                             .foreground(TEXT),
                                         TextBlock::new()
                                             .text(format!(
-                                                "{} · {}",
+                                                "Type: {} · Printer: {}",
                                                 association.network_type, association.printer
                                             ))
                                             .font_size(13.0)
@@ -535,48 +590,145 @@ impl Component for NetPrintSwitch {
             });
 
         let saved_content: View = if self.config.associations.is_empty() {
-            TextBlock::new()
-                .text("No associations saved yet.")
-                .foreground(MUTED)
-                .into()
+            StackPanel::new().spacing(4.0).children((
+                TextBlock::new()
+                    .text("No associations saved yet.")
+                    .foreground(TEXT),
+                TextBlock::new()
+                    .text("Choose a network and printer above to create your first one.")
+                    .font_size(13.0)
+                    .foreground(MUTED),
+            ))
         } else {
             StackPanel::new().spacing(8.0).keyed_children(saved_rows)
         };
 
+        let behavior_content = StackPanel::new().spacing(12.0).children((
+            TextBlock::new()
+                .text("Prompt frequency")
+                .font_weight(FontWeight::SEMI_BOLD)
+                .foreground(TEXT),
+            input_frame(
+                ComboBox::new()
+                    .items_source(prompt_items)
+                    .selected_index(prompt_index)
+                    .on_selection_changed(context.callback(Message::PromptModeChanged)),
+            ),
+            TextBlock::new()
+                .text("Close behavior")
+                .font_weight(FontWeight::SEMI_BOLD)
+                .foreground(TEXT),
+            input_frame(
+                ComboBox::new()
+                    .items_source(close_behavior_items)
+                    .selected_index(close_behavior_index)
+                    .on_selection_changed(context.callback(Message::CloseBehaviorChanged)),
+            ),
+        ));
+
+        let content_columns = if compact_layout {
+            vec![GridLength::STAR]
+        } else {
+            vec![GridLength::STAR, GridLength::STAR]
+        };
+        let content_rows = if compact_layout {
+            vec![GridLength::Auto, GridLength::Auto]
+        } else {
+            vec![GridLength::Auto]
+        };
         let content = ScrollViewer::new().content(
             Grid::new()
                 .rows([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-                .row_spacing(18.0)
-                .margin(Thickness::new(28.0, 24.0, 28.0, 28.0))
+                .row_spacing(12.0)
+                .margin(Thickness::new(24.0, 16.0, 24.0, 16.0))
                 .children((
                     StackPanel::new()
                         .grid_row(0)
                         .grid_column_span(2)
-                        .spacing(5.0)
+                        .spacing(3.0)
                         .children((
                             TextBlock::new()
                                 .text("NetPrintSwitch")
-                                .font_size(30.0)
+                                .font_size(28.0)
                                 .font_weight(FontWeight::BOLD)
                                 .foreground(TEXT),
                             TextBlock::new()
                                 .text("Switch your default printer when you change networks.")
-                                .font_size(15.0)
+                                .font_size(14.0)
                                 .foreground(MUTED),
                         )),
                     Grid::new()
                         .grid_row(1)
-                        .columns([GridLength::STAR, GridLength::STAR])
-                        .column_spacing(18.0)
+                        .rows(content_rows)
+                        .columns(content_columns)
+                        .row_spacing(if compact_layout { 18.0 } else { 0.0 })
+                        .column_spacing(if compact_layout { 0.0 } else { 18.0 })
                         .children((
                             StackPanel::new()
                                 .grid_column(0)
-                                .spacing(18.0)
+                                .spacing(12.0)
                                 .children((
+                                    card(
+                                        "Create an association",
+                                        "Choose the printer NetPrintSwitch should use on a network.",
+                                        StackPanel::new().spacing(8.0).children((
+                                            Border::new()
+                                                .padding(Thickness::xy(10.0, 5.0))
+                                                .corner_radius(4.0)
+                                                .background(Color::rgb(231, 243, 255))
+                                                .content(
+                                                    TextBlock::new()
+                                                        .text("Detected network")
+                                                        .font_weight(FontWeight::SEMI_BOLD)
+                                                        .foreground(ACCENT),
+                                                ),
+                                            TextBlock::new()
+                                                .text("Network name")
+                                                .font_weight(FontWeight::SEMI_BOLD)
+                                                .foreground(TEXT),
+                                            TextBox::new()
+                                                .text(&self.network_name)
+                                                .placeholder_text("Example: Studio Wi-Fi")
+                                                .background(CARD)
+                                                .border_brush(INPUT_STROKE)
+                                                .border_thickness(Thickness::uniform(1.0))
+                                                .is_enabled(!self.data_loading)
+                                                .on_text_changed(context.callback(Message::NetworkChanged)),
+                                            TextBlock::new()
+                                                .text("Printer")
+                                                .font_weight(FontWeight::SEMI_BOLD)
+                                                .foreground(TEXT),
+                                            input_frame(
+                                                ComboBox::new()
+                                                    .items_source(printer_items)
+                                                    .selected_index(self.selected_printer)
+                                                    .placeholder_text(printer_placeholder)
+                                                    .is_enabled(
+                                                        !self.data_loading && !self.printers.is_empty(),
+                                                    )
+                                                    .on_selection_changed(context.callback(Message::PrinterChanged)),
+                                            ),
+                                            Button::new()
+                                                .style(ButtonStyle::Accent)
+                                                .is_enabled(can_save)
+                                                .on_click(context.message(Message::SaveAssociation))
+                                                .content("Save association"),
+                                            TextBlock::new()
+                                                .text(if self.data_loading {
+                                                    "Loading current network and printers…"
+                                                } else if !can_save {
+                                                    "Enter a network name and select a printer to continue."
+                                                } else {
+                                                    "This association will replace an existing match for the same network."
+                                                })
+                                                .font_size(13.0)
+                                                .foreground(MUTED),
+                                        )),
+                                    ),
                                     card(
                                         "Current network",
                                         "The network detected by Windows right now.",
-                                        StackPanel::new().spacing(4.0).children((
+                                        StackPanel::new().spacing(5.0).children((
                                             TextBlock::new()
                                                 .text(network_summary)
                                                 .font_size(18.0)
@@ -588,106 +740,91 @@ impl Component for NetPrintSwitch {
                                                 .foreground(MUTED),
                                         )),
                                     ),
-                                    card(
-                                        "Create an association",
-                                        "Choose the printer NetPrintSwitch should use on a network.",
-                                        StackPanel::new().spacing(12.0).children((
-                                            TextBlock::new()
-                                                .text("Network name")
-                                                .font_weight(FontWeight::SEMI_BOLD)
-                                                .foreground(TEXT),
-                                            TextBox::new()
-                                                .text(&self.network_name)
-                                                .placeholder_text("Example: Studio Wi-Fi")
-                                                .background(CARD)
-                                                .border_brush(INPUT_STROKE)
-                                                .border_thickness(Thickness::uniform(1.0))
-                                                .on_text_changed(context.callback(Message::NetworkChanged)),
-                                            TextBlock::new()
-                                                .text("Printer")
-                                                .font_weight(FontWeight::SEMI_BOLD)
-                                                .foreground(TEXT),
-                                            input_frame(
-                                                ComboBox::new()
-                                                    .items_source(printer_items)
-                                                    .selected_index(self.selected_printer)
-                                                    .placeholder_text("Select a printer")
-                                                    .on_selection_changed(context.callback(Message::PrinterChanged)),
-                                            ),
-                                            Button::new()
-                                                .on_click(context.message(Message::SaveAssociation))
-                                                .content("Save association"),
-                                        )),
-                                    ),
                                 )),
                             StackPanel::new()
-                                .grid_column(1)
-                                .spacing(18.0)
+                                .grid_column(if compact_layout { 0 } else { 1 })
+                                .grid_row(if compact_layout { 1 } else { 0 })
+                                .spacing(12.0)
                                 .children((
                                     Border::new()
-                                        .padding(Thickness::uniform(16.0))
+                                        .padding(Thickness::uniform(14.0))
                                         .border_thickness(Thickness::uniform(1.0))
                                         .border_brush(STROKE)
                                         .corner_radius(8.0)
                                         .background(CARD)
                                         .content(
-                                            StackPanel::new().spacing(12.0).children((
+                                            StackPanel::new().spacing(8.0).children((
                                                 TextBlock::new()
-                                                    .text("Saved associations")
+                                                    .text(format!(
+                                                        "Saved associations ({})",
+                                                        self.config.associations.len()
+                                                    ))
                                                     .font_size(18.0)
                                                     .font_weight(FontWeight::SEMI_BOLD)
                                                     .foreground(TEXT),
+                                                TextBlock::new()
+                                                    .text("Each match is checked when Windows reports a network connection.")
+                                                    .font_size(13.0)
+                                                    .foreground(MUTED),
                                                 saved_content,
                                             )),
                                         ),
-                                    card(
-                                        "Behavior",
-                                        "Control prompts and what happens when the window closes.",
-                                        StackPanel::new().spacing(12.0).children((
-                                            TextBlock::new()
-                                                .text("Prompt frequency")
-                                                .font_weight(FontWeight::SEMI_BOLD)
-                                                .foreground(TEXT),
-                                            input_frame(
-                                                ComboBox::new()
-                                                    .items_source(prompt_items)
-                                                    .selected_index(prompt_index)
-                                                    .on_selection_changed(context.callback(Message::PromptModeChanged)),
-                                            ),
-                                            TextBlock::new()
-                                                .text("Close behavior")
-                                                .font_weight(FontWeight::SEMI_BOLD)
-                                                .foreground(TEXT),
-                                            input_frame(
-                                                ComboBox::new()
-                                                    .items_source(close_behavior_items)
-                                                    .selected_index(close_behavior_index)
-                                                    .on_selection_changed(context.callback(Message::CloseBehaviorChanged)),
-                                            ),
-                                        )),
-                                    ),
+                                    Border::new()
+                                        .padding(Thickness::uniform(12.0))
+                                        .border_thickness(Thickness::uniform(1.0))
+                                        .border_brush(STROKE)
+                                        .corner_radius(8.0)
+                                        .background(CARD)
+                                        .content(
+                                            Expander::new()
+                                                .is_expanded(self.behavior_expanded)
+                                                .on_is_expanded_changed(context.callback(
+                                                    Message::BehaviorExpandedChanged,
+                                                ))
+                                                .slots([
+                                                    SlotView::new(
+                                                        ExpanderSlot::Header,
+                                                        StackPanel::new().spacing(2.0).children((
+                                                            TextBlock::new()
+                                                                .text("Behavior")
+                                                                .font_size(18.0)
+                                                                .font_weight(FontWeight::SEMI_BOLD)
+                                                                .foreground(TEXT),
+                                                            TextBlock::new()
+                                                                .text("Prompt and close preferences")
+                                                                .font_size(13.0)
+                                                                .foreground(MUTED),
+                                                        )),
+                                                    ),
+                                                    SlotView::new(
+                                                        ExpanderSlot::Content,
+                                                        behavior_content,
+                                                    ),
+                                                ]),
+                                        ),
                                 )),
                         )),
-                    StackPanel::new()
+                    Grid::new()
                         .grid_row(2)
                         .grid_column_span(2)
-                        .spacing(8.0)
+                        .columns([GridLength::Auto, GridLength::STAR])
+                        .column_spacing(12.0)
                         .children((
                             Button::new()
+                                .is_enabled(!self.data_loading)
                                 .on_click(context.message(Message::Refresh))
-                                .content("Refresh printers and network"),
-                            TextBlock::new()
-                                .text(&self.status)
-                                .font_size(13.0)
-                                .foreground(if self.status.starts_with("Could not")
-                                    || self.status.contains("failed")
-                                    || self.status.contains("invalid")
-                                    || self.status.contains("unavailable")
-                                {
-                                    Color::rgb(196, 43, 28)
+                                .content(if self.data_loading {
+                                    "Refreshing…"
                                 } else {
-                                    ACCENT
+                                    "Refresh printers and network"
                                 }),
+                            InfoBar::new()
+                                .grid_column(1)
+                                .title(status_title)
+                                .message(&self.status)
+                                .severity(status_severity)
+                                .is_closable(false)
+                                .is_open(true),
                         )),
                 )),
         );
@@ -794,13 +931,13 @@ impl NetPrintSwitch {
 
 fn card(title: &str, description: &str, content: impl Into<View>) -> View {
     Border::new()
-        .padding(Thickness::uniform(16.0))
+        .padding(Thickness::uniform(14.0))
         .border_thickness(Thickness::uniform(1.0))
         .border_brush(STROKE)
         .corner_radius(8.0)
         .background(CARD)
         .content(
-            StackPanel::new().spacing(10.0).children((
+            StackPanel::new().spacing(8.0).children((
                 TextBlock::new()
                     .text(title)
                     .font_size(18.0)
