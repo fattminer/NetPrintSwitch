@@ -1,0 +1,21 @@
+[package]
+name = "netprintswitch"
+version = "0.1.0"
+edition = "2021"
+description = "Switch the Windows default printer by network association"
+license-file = "LICENSE"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows-reactor = { git = "https://github.com/microsoft/windows-rs.git", rev = "a6b6ef58f8efb2f2bdef86a2f6cd5f768eb7c545", package = "windows-reactor" }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging"
+] }

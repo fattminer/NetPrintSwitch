@@ -18,18 +18,19 @@ that reproduces its functionality. Any license notice or attribution
 required by the License must also include this Commons Clause License
 Condition notice.
 
-Software:   NetPrintSwitch
+Software:   unifi-studio
 License:    GNU Affero General Public License v3.0 (AGPL-3.0)
 Licensor:   fattminer
 
 ---
+
 
                     GNU AFFERO GENERAL PUBLIC LICENSE
                        Version 3, 19 November 2007
 
  Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
 
- AGPL-3.0 terms as applied to NetPrintSwitch:
+ AGPL-3.0 terms as applied to unifi-studio:
  Copyright (c) 2026 fattminer
  Everyone is permitted to copy and distribute verbatim copies
  of this license document, but changing it is not allowed.

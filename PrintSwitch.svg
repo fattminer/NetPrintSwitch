@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">PrintSwitch application icon</title>
+  <desc id="desc">A gray printer, a white network globe, and two warm orange switching arrows.</desc>
+
+  <!-- Network globe -->
+  <g fill="none" stroke="#919191" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="386" cy="142" r="91" fill="#ffffff" stroke-width="18"/>
+    <ellipse cx="386" cy="142" rx="38" ry="91" stroke-width="12"/>
+    <path d="M300 142h172M316 99h140M316 185h140" stroke-width="12"/>
+  </g>
+
+  <!-- Printer -->
+  <path fill="#919191" fill-rule="evenodd" d="M126 67h191a25 25 0 0 1 25 25v99H101V92a25 25 0 0 1 25-25Zm25 43v67h141v-67H151Z"/>
+  <rect x="43" y="174" width="331" height="247" rx="48" fill="#919191"/>
+  <circle cx="102" cy="241" r="18" fill="#ffffff"/>
+  <path d="M121 302h188a18 18 0 0 1 18 18v76H103v-76a18 18 0 0 1 18-18Z" fill="#ffffff"/>
+  <path d="M141 348h148l24 73H117l24-73Z" fill="#919191"/>
+
+  <!-- Switching arrows -->
+  <g fill="none" stroke="#ffba70" stroke-linecap="round" stroke-linejoin="round" stroke-width="34">
+    <path d="M446 274c-11-51-49-75-102-66"/>
+    <path d="m360 179-31 32 39 25"/>
+    <path d="M338 369c57 12 105-21 110-76"/>
+    <path d="m421 307 28-30 27 36"/>
+  </g>
+</svg>
