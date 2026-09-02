@@ -1,7 +1,7 @@
 # NetPrintSwitch alpha
 
 Rust-based Windows tray utility. Associates Wi-Fi SSIDs or Ethernet network names with installed Windows printers, then asks before changing the default printer.
-
+# BUILT USING AI
 ## Run
 
 Requirements:
